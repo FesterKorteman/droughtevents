@@ -1,0 +1,324 @@
+ // Load the Area of interest (AOI)
+ 
+var AOI= ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+ .filterMetadata('country_co', 'equals', 'NG');// country_na/wld_rgn/country_co
+     
+                
+//Map.centerObject(AOI, 3) 
+
+ 
+  //------------------------ Calculate SPI-12 ------------------------------//
+  
+  // Define start and end years  
+var startyear = 1958                // min: 1958
+var endyear = 2023                 //max: 2023
+var scale = 4638.3              // terraclimate
+
+// Year of interest, if caculating for a particular year
+                
+var YOI = 2021
+var YOI_minus_1 = LULC_2021
+var YOI_zero = LULC_2022
+  
+   // Filter precipitation for Year of Interest
+var YOI_precipitation = input_data
+                  .filter(ee.Filter.calendarRange(YOI, YOI, 'year'))
+                  .select('pr')
+                  .filterBounds(AOI)
+
+  // Filter precipitation for the whole period
+var whole_precipitation = input_data
+                  .filter(ee.Filter.calendarRange(startyear, endyear, 'year'))
+                  .select('pr')
+                  .filterBounds(AOI)
+// Map.addLayer(whole_precipitation,'', 'whole prec')
+
+  // Function to calculate yearly sum of precipitation 
+var yearlysum = function(pr){
+  var years = ee.List.sequence(startyear,endyear);
+  return ee.ImageCollection.fromImages(years.map(function(year) {
+    var sum_yearly = pr.filter(ee.Filter.calendarRange(year, year, 'year')).sum();
+    return sum_yearly.set('year',year)  
+   }));
+ }
+ 
+ // Calculate yearly sum of precipitation for the whole period
+var whole_period_sum_pr = yearlysum(whole_precipitation) ;
+var whole_period_sum_pr_bands = whole_period_sum_pr.toBands().clip(AOI);
+var sum_pr = whole_period_sum_pr_bands.reduce(ee.Reducer.sum()) ; 
+// Map.addLayer(whole_period_sum_pr_bands,'','whole_period_sum_pr_bands',0)
+
+  // Calculate precipitation sum for YOI
+var YOI_sum_pr = yearlysum(YOI_precipitation) ;
+var YOI_sum_pr_bands = YOI_sum_pr.toBands().clip(AOI);
+// Map.addLayer(YOI_sum_pr_bands,'','YOI_sum_pr_bands',0)
+
+  //Masks and counts precipitation equal to, and above 0
+var pr_above_zero = whole_period_sum_pr_bands.gt(0) ; 
+var count_pr_above_zero = pr_above_zero.reduce(ee.Reducer.sum()) ; 
+var pr_equal_zero = whole_period_sum_pr_bands.eq(0) ;   
+var count_pr_equal_zero = pr_equal_zero.reduce(ee.Reducer.sum()) ; 
+var N = whole_period_sum_pr_bands.reduce(ee.Reducer.count()) ; 
+//print('pr above 0', count_pr_above_zero)
+//Map.addLayer(count_pr_above_zero, '','count_pr_above_zero',0)
+//Map.addLayer(count_pr_equal_zero, '','count_pr_equal_zero',0)
+
+
+  // Calculations for A
+var mean_pr = sum_pr.divide(count_pr_above_zero) ; //weighted average, not considering values eq 0
+var log_pr = whole_period_sum_pr_bands.log() ; 
+var sum_log_pr = log_pr.reduce(ee.Reducer.sum());
+var log_mean_pr = mean_pr.log() ;
+var A = log_mean_pr.subtract(sum_log_pr.divide(count_pr_above_zero)); 
+//Map.addLayer(A,'','A',0)
+
+  // alpha and beta calculations 
+var alpha = A.multiply(4).divide(3).add(1).sqrt().add(1).divide(A.multiply(4)) 
+var beta = mean_pr.divide(alpha) 
+//Map.addLayer(alpha,'','alpha',0)
+//Map.addLayer(beta,'','beta',0)
+
+
+  // Calculates the regularized lower incomplete Gamma function, G(x),
+  // run for all years (whole_period_sum_pr_bands) or YOI (YOI_sum_pr_bands)
+var x = YOI_sum_pr_bands.divide(beta) 
+var G_x = x.gammainc(alpha) ;
+//Map.addLayer(x,'','x',0)
+//Map.addLayer(G_x,'','G(x)',0)
+
+
+  // Since the gamma distribution is undefined for x = 0, and q = P (x = 0) > 0
+  //  where P (x = 0) is the probability of zero precipitation (q):
+var zero_prob = count_pr_equal_zero.divide(N) ; //P(x=0)
+//Map.addLayer(zero_prob,'','probability_zero',0)
+
+  // Calculate H(x)= q + (1 - q)*G(x)
+var Hx = zero_prob.add(ee.Image.constant(1).subtract(zero_prob).multiply(G_x)) //(13)
+// Map.addLayer(Hx,'','hx',0)
+
+  // Assessing  variable t for when 0<H(x)<=0,5 and 0,5<(H(x)<=1////
+var t1 = ee.Image.constant(1).divide(Hx.pow(2)).log().sqrt()  // for 0<H(x)<=0,5
+var t2 = ee.Image.constant(1).divide(ee.Image.constant(1)
+          .subtract(Hx).pow(2)).log().sqrt() //when 0,5<(H(x)<=1
+// Map.addLayer(t1,'','t1',0)
+// Map.addLayer(t2,'','t2',0)
+
+
+  // Definine the condition for t, and what t to use
+var condition = Hx.lte(0.5) // This line checks if the value of Hx is less than or equal to 0.5. 
+  //If Hx meets this condition, it will be assigned true; otherwise, it will be assigned false.
+
+var t = ee.Image(t2).where(condition , t1) ; //The where function is used to create the variable t based on the condition specified.
+  //If the condition (Hx <= 0.5) is true, t will take the value of t1; otherwise, it will take the value of t2.
+  //This effectively assigns t1 to t when Hx is less than or equal to 0.5 and t2 otherwise.
+
+  //Constants for SPI calculations with gamma distribution
+var c0 = 2.515517
+var c1 = 0.802583
+var c2 = 0.010328
+var d1 = 1.432788
+var d2 = 0.189269
+var d3 = 0.001308
+
+
+  // Calculating SPI by first breaking it up
+var numerator = ee.Image.constant(c0)
+.add(ee.Image.constant(c1).multiply(t))
+.add(ee.Image.constant(c2).multiply(t.pow(2)))
+
+var denominator = ee.Image.constant(1)
+.add(ee.Image.constant(d1).multiply(t)
+.add(ee.Image.constant(d2).multiply(t.pow(2)))
+.add(ee.Image.constant(d3).multiply(t.pow(3))));
+
+var SPI = t.subtract(numerator.divide(denominator))
+var SPI_final= ee.Image(SPI).where(condition,SPI.multiply(-1))
+Map.addLayer(SPI_final, '', 'SPI-12 ',0)
+
+
+
+// ------------------------------ LULC change ----------------------//
+
+  // Set the visualization ranges and color palette for SPI.
+var visParams = {
+  min: -2.33, 
+  max:  2.33,
+  palette: [
+    '8b1a1a', 'de2929', 'f3641d',
+    'fdc404', '9afa94', '03f2fd',
+    '12adf3', '1771de', '00008b',
+  ]};
+  
+  // Set the visual parameters and range for the LULC layers 
+var lulc_vis = {min: 0, max: 220, 
+  palette: ['000000','FFFF64','FFFF64','FFFF00','AAF0F0','DCF064',
+  'C8C864','006400','00A000','00A000',
+  'AAC800','003C00','003C00','005000',
+  '285000','285000','286400','788200',
+  '8CA000','BE9600','966400','966400',
+  '966400','FFB432','FFDCD2','FFEBAF',
+  'FFC864','FFD278','FFEBAF','00785A',
+  '009678','00DC82','C31400','FFF5D7',
+  'DCDCDC','FFF5D7','0046C8','FFFFFF']} // pink for testing 'FF00FF' ,
+ 
+  // Load the years of interest  
+// var year1 = LULC_2018 // year before drought
+// var year2 = LULC_2019 // year of drought
+
+  // Convert AOI from FeatureCollection to Geometry (MultiPolygon) for year1         
+var geom = AOI.geometry() 
+
+var LULC_AOI = YOI_minus_1.clip(geom)  
+//Map.addLayer(LULC_AOI, lulc_vis, 'LULC')
+
+  // Filters out pixels by chosen threshold (lte=less than or equal) and makes it an integer
+var SPI_int=SPI_final.toInt();
+var drought_periods = SPI_int.updateMask(SPI_int.lte(-1));
+//Map.addLayer(drought_periods, visParams, 'Drought')
+
+
+  // Converts the drought image to vectors and creates polygons for drought affected areas
+var drought_vec = drought_periods.addBands(drought_periods).reduceToVectors({
+    geometry: AOI,
+    scale: 1113.195,
+    geometryType: 'polygon',
+    labelProperty: 'drought',
+    reducer: ee.Reducer.anyNonZero(),
+    maxPixels : 1e12
+  }).geometry()
+// Map.addLayer(drought_vec, {color:'yellow'}, 'Drought (vector)')
+
+  // Clips LULC to affected drought areas
+var year1_drought = LULC_AOI.clip(drought_vec);
+//Map.addLayer(year1_drought, lulc_vis, 'LULC year 1') 
+var year2_drought = YOI_zero.clip(drought_vec)
+//Map.addLayer(year2_drought, lulc_vis, 'LULC year 2')
+
+
+  // Identifies Landuse change in drought affected areas (green = no change, red = change)
+var landuse_change = year1_drought.neq(year2_drought)
+Map.addLayer(landuse_change, {min: 0, max: 1, palette: ['green', 'red']}, 'Land use change between two years, red/green') 
+
+  // Updates the identified change with the original LULC type 
+var LULC_b1 = LULC_AOI.select('b1');
+var changedLULC = LULC_b1.updateMask(landuse_change); 
+//Map.addLayer(changedLULC, lulc_vis, 'Changes in LULC by type'); 
+
+
+  //  Calculates areas of change
+// var AOI_km2 = AOI.geometry().area().divide(1e6)
+// print('Area AOI [km2]', AOI_km2)
+var drought_km2 = year1_drought.geometry().area().divide(1e6)
+
+
+var LULC_changes_km2 = landuse_change
+  .multiply(ee.Image.pixelArea())
+  .divide(1e6)
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+     geometry: AOI.geometry(),
+    scale: 1113.195,
+    maxPixels: 1e13
+  }).getNumber('b1');
+
+print('Drought area AOI [km2]', drought_km2) 
+print('LULC changes in drought area [km2]', LULC_changes_km2);
+
+//var percentage_change = LULC_changes_km2.divide(drought_km2).multiply(100)
+//print ('Percentage Land use change of drought area', percentage_change)
+
+//var percentage_change_total = LULC_changes_km2.divide(AOI_km2).multiply(100)
+//print ('Percentage Land use change of AOI', percentage_change_total)
+
+  //////------LULC CLASSES------ /////
+    
+// var urban_area = year1_drought.select('b1').eq(190)
+//   .multiply(ee.Image.pixelArea())
+//   .divide(1000000)
+//   .reduceRegion({
+//     reducer: ee.Reducer.sum(),
+//     geometry: AOI.geometry(),
+//   scale: 1113.195,
+//     maxPixels: 1e13
+//   }).getNumber('b1');
+// print('YOI Urban', urban_area)
+  
+// var grass_shrubland_area=year1_drought.select('b1').eq(120)
+//   .or(year1_drought.select('b1').eq(121))
+//   .or(year1_drought.select('b1').eq(122))
+//   .or(year1_drought.select('b1').eq(130))
+//   .multiply(ee.Image.pixelArea())
+//   .divide(1000000)
+//   .reduceRegion({
+//     reducer: ee.Reducer.sum(),
+//     geometry: AOI.geometry(),
+//     scale: 1113.195,
+//     maxPixels: 1e13
+//   }).getNumber('b1');
+// print('YOI Shrub/Grassland', grass_shrubland_area)
+
+ 
+// var trees_area=year1_drought.select('b1').eq(50)
+//   .or(year1_drought.select('b1').eq(60))
+//   .or(year1_drought.select('b1').eq(61))
+//   .or(year1_drought.select('b1').eq(62))
+//   .or(year1_drought.select('b1').eq(70))
+//   .or(year1_drought.select('b1').eq(71))
+//   .or(year1_drought.select('b1').eq(72))
+//   .or(year1_drought.select('b1').eq(80))
+//   .or(year1_drought.select('b1').eq(81))
+//   .or(year1_drought.select('b1').eq(82))
+//   .or(year1_drought.select('b1').eq(90))
+//   .or(year1_drought.select('b1').eq(100))
+//   .multiply(ee.Image.pixelArea())
+//   .divide(1000000)
+//   .reduceRegion({
+//     reducer: ee.Reducer.sum(),
+//     geometry: AOI.geometry(),
+//     scale: 1113.195,
+//     maxPixels: 1e13
+//   }).getNumber('b1');
+// print('YOI Tree cover ', trees_area)
+ 
+// var cropland_area=year1_drought.select('b1').eq(10)
+//   .or(year1_drought.select('b1').eq(11))
+//   .or(year1_drought.select('b1').eq(12))
+//   .or(year1_drought.select('b1').eq(20))
+//   .or(year1_drought.select('b1').eq(30))
+//   .multiply(ee.Image.pixelArea())
+//   .divide(1000000)
+//   .reduceRegion({
+//     reducer: ee.Reducer.sum(),
+//     geometry: AOI.geometry(),
+//     scale: 1113.195,
+//     maxPixels: 1e13
+//   }).getNumber('b1');
+// print('YOI Cropland', cropland_area)
+ 
+// var bareland_area=year1_drought.select('b1').eq(200)
+//   .or(year1_drought.select('b1').eq(201))
+//   .or(year1_drought.select('b1').eq(202))
+//   .multiply(ee.Image.pixelArea())
+//   .divide(1000000)
+//   .reduceRegion({
+//     reducer: ee.Reducer.sum(),
+//     geometry: AOI.geometry(),
+//     scale: 1113.195,
+//     maxPixels: 1e13
+//   }).getNumber('b1');
+// print('YOI Bareland', bareland_area)
+ 
+// var sparse_area=year1_drought.select('b1').eq(150)
+//   .or(year1_drought.select('b1').eq(151))
+//   .or(year1_drought.select('b1').eq(152))
+//     .or(year1_drought.select('b1').eq(153))
+//   .multiply(ee.Image.pixelArea())
+//   .divide(1000000)
+//   .reduceRegion({
+//     reducer: ee.Reducer.sum(),
+//     geometry: AOI.geometry(),
+//     scale: 1113.195,
+//     maxPixels: 1e13
+//   }).getNumber('b1');
+// print('YOI sparse veg', sparse_area)
+
